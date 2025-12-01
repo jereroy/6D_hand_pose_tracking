@@ -2,3 +2,5 @@ zed/svo
 zed-examples
 zed/vid
 zed/HandTrackingModule/__pycache__
+/6dofenv
+/HandTrackingModule/__pycache__
