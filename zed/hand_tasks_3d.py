@@ -23,8 +23,6 @@ HAND_CONNECTIONS = [
     [0,17], [17,18], [18,19], [19,20],
 ]
 
-
-
 # =========================================================
 # ----------------------- UDP SETUP -----------------------
 # =========================================================
@@ -194,8 +192,8 @@ def main():
         # if left_pts is not None:
         #     vis3d.show_hand(left_pts, vis3d.blue)
 
-        if right_pts is not None:
-            vis3d.show_hand(right_pts, vis3d.red)
+        # if right_pts is not None:
+        #     vis3d.show_hand(right_pts, vis3d.red)
 
         # -------------------------
         # ZED DISPLAY (image + depth)

@@ -5,7 +5,7 @@ import numpy as np
 import sys
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
-
+import pyzed.sl as sl
 
 class HandTracking():
     def __init__(self, maxHands=2, detectionCon=0.2, trackCon=0.9):
@@ -44,56 +44,76 @@ class HandTracking():
             
         return img
 
-    
-    def findpostion(self, img, pcl,camera_params):
-        fx = camera_params.fx  # Focal length in pixels (x-axis)
-        fy = camera_params.fy  # Focal length in pixels (y-axis)
-        cx = camera_params.cx  # X-coordinate of the principal point
-        cy = camera_params.cy  # Y-coordinate of the principal point
+    def findpostion(self, img, pcl, camera_params):
+        fx = camera_params.fx
+        fy = camera_params.fy
+        cx = camera_params.cx
+        cy = camera_params.cy
+
         h, w, _ = img.shape
-        left_data = []
-        right_data = []
-        if self.results.multi_hand_landmarks:
-             for landmarks in self.results.multi_hand_landmarks:
-                handedness = self.results.multi_handedness[self.results.multi_hand_landmarks.index(landmarks)].classification[0].index
-                for id, landmark in enumerate(landmarks.landmark):
-                    
-                    # Find the pixel coordinates of the wrist
-                    if id == 0:
-                        wrist_landmark_coordinate = [landmark.x, landmark.y, landmark.z]
-                        X, Y = int(landmark.x * w), int(landmark.y * h)
 
-                        # circle cx, cy
-                        cv2.circle(img, (X, Y), 10, (0, 0, 255), -1)
-                        # Use ZED point cloud to estimate 3D position of wrist
-                        try:
-                            err, point_cloud_value = pcl.get_value(X, Y)
-                            wrist_position = [point_cloud_value[0], point_cloud_value[1], point_cloud_value[2]]
-                        except:
-                            continue
+        # ALWAYS start with empty numpy arrays
+        left_data = np.zeros((0,3), dtype=np.float32)
+        right_data = np.zeros((0,3), dtype=np.float32)
 
-                    x_3d = wrist_position[0] + (landmark.x*w - wrist_landmark_coordinate[0]*w - cx) * wrist_position[2] / fx
-                    y_3d = wrist_position[1] + (landmark.y*h - wrist_landmark_coordinate[1]*w - cy) * wrist_position[2] / fy
-                    z_3d = wrist_position[2] + (landmark.z - wrist_landmark_coordinate[2]) * wrist_position[2]
-                    hand_landmarks_3d = [x_3d, y_3d, z_3d]
-                    # append the 3D position of each 3D landmark
-                    if handedness == 1:
-                        left_data.append(hand_landmarks_3d)
-                        # put text left hand
-                        cv2.putText(img, "Left", (X, Y), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-                    elif handedness == 0:
-                        right_data.append(hand_landmarks_3d) 
-                        # put text right hand
-                        cv2.putText(img, "Right", (X, Y), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-               
-   
-        # Convert the data to a numpy array
-        left_data = np.array(left_data)
-        right_data = np.array(right_data)
-        self.stdout_hand_detection(left_data,right_data)
-      
+        if not self.results.multi_hand_landmarks:
+            return left_data, right_data
+
+        for hand_idx, landmarks in enumerate(self.results.multi_hand_landmarks):
+
+            handedness = self.results.multi_handedness[hand_idx].classification[0].index
+            hand_points = []
+
+            for id, landmark in enumerate(landmarks.landmark):
+
+                px = int(landmark.x * w)
+                py = int(landmark.y * h)
+                
+                if px < 0: px = 0
+                if py < 0: py = 0
+                if px >= w: px = w - 1
+                if py >= h: py = h - 1
+
+
+                # Try to get ZED depth
+                err, pc_val = pcl.get_value(px, py)
+
+                try:
+                    pc = np.array(pc_val, dtype=np.float32)
+                except:
+                    pc = np.array([np.nan, np.nan, np.nan], dtype=np.float32)
+
+                valid_pc = (
+                    err == sl.ERROR_CODE.SUCCESS and
+                    np.isfinite(pc[2]) and
+                    0.05 < pc[2] < 1.5
+                )
+
+                if valid_pc:
+                    X, Y, Z = pc[0], pc[1], pc[2]
+                else:
+                    # fallback MP depth + camera intrinsics
+                    Z = float(landmark.z) * 0.12
+                    X = (px - cx) * Z / fx
+                    Y = (py - cy) * Z / fy
+
+                hand_points.append([X, Y, Z])
+
+            # NOW convert to numpy ALWAYS
+            hand_points = np.array(hand_points, dtype=np.float32)
+
+            if handedness == 1:
+                left_data = hand_points
+            else:
+                right_data = hand_points
+
+        # FINAL SAFETY: ensure numpy arrays
+        left_data = np.array(left_data, dtype=np.float32)
+        right_data = np.array(right_data, dtype=np.float32)
 
         return left_data, right_data
+
+
     
     def calculate_orientation(self,hand_landmarks_3d):
         if hand_landmarks_3d.shape != (21,3):

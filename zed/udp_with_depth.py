@@ -77,8 +77,8 @@ def main():
             data_left, data_right = detector.findpostion(depth_img, pcl, camera_params)
 
             # ----------- VISUALIZATION -----------
-            vis3d.show_hand(data_left,  vis3d.blue)
-            vis3d.show_hand(data_right, vis3d.red)
+            # vis3d.show_hand(data_left,  vis3d.blue)
+            # vis3d.show_hand(data_right, vis3d.red)
 
             # ----------- UDP SEND -----------
             send_udp_right(data_right)
