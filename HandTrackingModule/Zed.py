@@ -1,3 +1,4 @@
+
 import sys
 import pyzed.sl as sl
 import numpy as np
@@ -102,3 +103,7 @@ class Zed():
 
         import cv2
         self.depth_img = cv2.applyColorMap(depth_vis, cv2.COLORMAP_JET)
+
+    def close(self):
+        if hasattr(self, 'zed'):
+            self.zed.close()

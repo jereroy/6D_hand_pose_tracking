@@ -1,45 +1,54 @@
 import open3d as o3d
+import numpy as np
 
-"""
-Class for visualizing the hand landmarks and camera using open 3D
-"""
+HAND_CONNECTIONS = [
+    [0,1], [1,2], [2,3], [3,4],
+    [0,5], [5,6], [6,7], [7,8],
+    [0,9], [9,10], [10,11], [11,12],
+    [0,13], [13,14], [14,15], [15,16],
+    [0,17], [17,18], [18,19], [19,20],
+]
 
 class Vis3D():
     def __init__(self):
         self.vis = o3d.visualization.Visualizer()
         self.vis.create_window()
+
+        # Axes
         self.mesh_frame = o3d.geometry.TriangleMesh.create_coordinate_frame(size=0.1)
         self.vis.add_geometry(self.mesh_frame)
 
-        # Initialize left and right hand point clouds
-        self.pcd_left = o3d.geometry.PointCloud()
-        self.pcd_left.paint_uniform_color([1, 0.706, 0])
-        self.vis.add_geometry(self.pcd_left)
-
-        self.pcd_right = o3d.geometry.PointCloud()
-        self.pcd_right.paint_uniform_color([0, 0.651, 0.929])
-        self.vis.add_geometry(self.pcd_right)
-
+        # Unique point cloud like your original code
         self.pcd_hand = o3d.geometry.PointCloud()
-        self.pcd_hand.paint_uniform_color([0, 0.651, 0.929])
         self.vis.add_geometry(self.pcd_hand)
 
+        # Unique LineSet for bones
+        self.line_set = o3d.geometry.LineSet()
+        self.vis.add_geometry(self.line_set)
+
+        # Colors
         self.blue = [0, 0, 1]
         self.red = [1, 0, 0]
 
+    def show_hand(self, data, color=[0,0,1]):
+        if data is None or data.shape != (21, 3):
+            return
 
-    def show_hand(self,data,color=[0, 0, 1]):
-        # return none if no data
-        if data.shape != (21,3):
-            return None
-        else:
-            self.vis.remove_geometry(self.pcd_hand)
-            self.pcd_hand = o3d.geometry.PointCloud()
-            self.pcd_hand.points = o3d.utility.Vector3dVector(data)
-            self.pcd_hand.paint_uniform_color(color)
-            self.vis.add_geometry(self.pcd_hand)
+        # Update points
+        self.pcd_hand.points = o3d.utility.Vector3dVector(data)
+        self.pcd_hand.colors = o3d.utility.Vector3dVector(
+            np.tile(color, (21,1))
+        )
 
-              # Update visualization
-            self.vis.poll_events()
-            self.vis.update_renderer()
+        # Update bones
+        self.line_set.points = o3d.utility.Vector3dVector(data)
+        self.line_set.lines = o3d.utility.Vector2iVector(HAND_CONNECTIONS)
+        self.line_set.colors = o3d.utility.Vector3dVector(
+            np.tile(color, (len(HAND_CONNECTIONS),1))
+        )
 
+        # Update scene
+        self.vis.update_geometry(self.pcd_hand)
+        self.vis.update_geometry(self.line_set)
+        self.vis.poll_events()
+        self.vis.update_renderer()

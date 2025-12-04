@@ -195,7 +195,11 @@ def main():
                     ax.set_ylabel("Y (m)")
                     ax.set_zlabel("Z (m)")
 
-                    ax.scatter3D(X, Y, Z, s=40)
+                    # Multiplier Y par -1 pour remettre la main à l'endroit
+                    data_plot_fixed = data_plot_valid.copy()
+                    data_plot_fixed[:,1] *= -1  # Inverse Y
+                    data_plot_fixed[:,2] *= -1  # Inverse Z
+                    ax.scatter3D(data_plot_fixed[:,0], data_plot_fixed[:,1], data_plot_fixed[:,2], s=40)
 
                     # Connexions des doigts (même topologie, indices 0..20)
                     edges = [
@@ -230,17 +234,17 @@ def main():
                             for edge in edges:
                                 i, j = edge[0] + offset, edge[1] + offset
                                 ax.plot3D(
-                                    [data_plot_valid[i, 0], data_plot_valid[j, 0]],
-                                    [data_plot_valid[i, 1], data_plot_valid[j, 1]],
-                                    [data_plot_valid[i, 2], data_plot_valid[j, 2]],
+                                    [data_plot_fixed[i, 0], data_plot_fixed[j, 0]],
+                                    [data_plot_fixed[i, 1], data_plot_fixed[j, 1]],
+                                    [data_plot_fixed[i, 2], data_plot_fixed[j, 2]],
                                 )
                     elif n == 21:
                         for edge in edges:
                             i, j = edge
                             ax.plot3D(
-                                [data_plot_valid[i, 0], data_plot_valid[j, 0]],
-                                [data_plot_valid[i, 1], data_plot_valid[j, 1]],
-                                [data_plot_valid[i, 2], data_plot_valid[j, 2]],
+                                [data_plot_fixed[i, 0], data_plot_fixed[j, 0]],
+                                [data_plot_fixed[i, 1], data_plot_fixed[j, 1]],
+                                [data_plot_fixed[i, 2], data_plot_fixed[j, 2]],
                             )
 
                     plt.draw()
