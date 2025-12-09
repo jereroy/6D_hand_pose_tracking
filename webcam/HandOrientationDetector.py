@@ -8,6 +8,14 @@ from mediapipe.tasks.python import vision
 
 SMOOTHING_ALPHA = 0.3
 FINGER_ORDER = ["Thumb", "Index", "Middle", "Ring", "Pinky"]
+ORIENTATION_AXES = ["Pitch", "Yaw", "Roll"]
+FINGER_TIP_INDEX = {
+    "Thumb": 4,
+    "Index": 8,
+    "Middle": 12,
+    "Ring": 16,
+    "Pinky": 20,
+}
 
 
 # ---------------------------------------------------------
@@ -159,6 +167,162 @@ def draw_hand_axes(image, hand_landmarks, axes):
         )
 
 
+class HorizontalFingerTracker:
+    def __init__(self, min_span=0.02):
+        self.min_span = min_span
+        self.baseline = {}
+        self.span_left = {}
+        self.span_right = {}
+        self.values = {}
+        self.is_calibrated = False
+
+    def reset(self):
+        self.baseline.clear()
+        self.span_left.clear()
+        self.span_right.clear()
+        self.values.clear()
+        self.is_calibrated = False
+
+    def calibrate(self, hand_landmarks, axes):
+        if axes is None or "right" not in axes:
+            return False
+
+        wrist = landmark_to_np(hand_landmarks[0])
+        right_axis = axes["right"]
+
+        for finger, tip_idx in FINGER_TIP_INDEX.items():
+            tip = landmark_to_np(hand_landmarks[tip_idx])
+            projection = float(np.dot(tip - wrist, right_axis))
+            self.baseline[finger] = projection
+            self.span_left[finger] = self.min_span
+            self.span_right[finger] = self.min_span
+            self.values[finger] = 0.0
+
+        self.is_calibrated = True
+        return True
+
+    def update(self, hand_landmarks, axes):
+        if not self.is_calibrated or axes is None or "right" not in axes:
+            return None
+
+        wrist = landmark_to_np(hand_landmarks[0])
+        right_axis = axes["right"]
+        updated = {}
+
+        for finger, tip_idx in FINGER_TIP_INDEX.items():
+            baseline = self.baseline.get(finger)
+            if baseline is None:
+                continue
+
+            tip = landmark_to_np(hand_landmarks[tip_idx])
+            projection = float(np.dot(tip - wrist, right_axis))
+            delta = projection - baseline
+
+            if delta < 0:
+                self.span_left[finger] = max(self.span_left.get(finger, self.min_span), abs(delta))
+                denom = self.span_left[finger]
+            else:
+                self.span_right[finger] = max(self.span_right.get(finger, self.min_span), abs(delta))
+                denom = self.span_right[finger]
+
+            denom = max(denom, self.min_span)
+            normalized = float(np.clip(delta / denom, -1.0, 1.0))
+            smoothed = smooth_scalar(self.values.get(finger), normalized)
+            self.values[finger] = smoothed
+            updated[finger] = smoothed
+
+        return updated if updated else None
+
+
+def axes_to_matrix(axes):
+    if axes is None:
+        return None
+
+    required = ["right", "up", "forward"]
+    if not all(axis in axes and axes[axis] is not None for axis in required):
+        return None
+
+    return np.column_stack((axes["right"], axes["up"], axes["forward"]))
+
+
+def rotation_matrix_to_euler_zyx(matrix):
+    # Returns pitch (around Y), yaw (around Z), roll (around X)
+    if matrix is None:
+        return None
+
+    m20 = matrix[2, 0]
+    if abs(m20) < 1.0:
+        pitch = np.arcsin(-m20)
+        roll = np.arctan2(matrix[2, 1], matrix[2, 2])
+        yaw = np.arctan2(matrix[1, 0], matrix[0, 0])
+    else:
+        pitch = np.pi / 2 if m20 <= -1.0 else -np.pi / 2
+        roll = 0.0
+        yaw = np.arctan2(-matrix[0, 1], matrix[1, 1])
+
+    return {
+        "Pitch": pitch,
+        "Yaw": yaw,
+        "Roll": roll,
+    }
+
+
+class WristOrientationTracker:
+    def __init__(self, min_span_deg=15.0):
+        self.min_span = np.deg2rad(min_span_deg)
+        self.baseline_matrix = None
+        self.span_neg = {axis: self.min_span for axis in ORIENTATION_AXES}
+        self.span_pos = {axis: self.min_span for axis in ORIENTATION_AXES}
+        self.values = {axis: 0.0 for axis in ORIENTATION_AXES}
+        self.is_calibrated = False
+
+    def reset(self):
+        self.baseline_matrix = None
+        self.span_neg = {axis: self.min_span for axis in ORIENTATION_AXES}
+        self.span_pos = {axis: self.min_span for axis in ORIENTATION_AXES}
+        self.values = {axis: 0.0 for axis in ORIENTATION_AXES}
+        self.is_calibrated = False
+
+    def calibrate(self, axes):
+        matrix = axes_to_matrix(axes)
+        if matrix is None:
+            return False
+
+        self.baseline_matrix = matrix
+        self.span_neg = {axis: self.min_span for axis in ORIENTATION_AXES}
+        self.span_pos = {axis: self.min_span for axis in ORIENTATION_AXES}
+        self.values = {axis: 0.0 for axis in ORIENTATION_AXES}
+        self.is_calibrated = True
+        return True
+
+    def update(self, axes):
+        if not self.is_calibrated or self.baseline_matrix is None:
+            return None
+
+        current_matrix = axes_to_matrix(axes)
+        if current_matrix is None:
+            return None
+
+        delta = current_matrix @ self.baseline_matrix.T
+        angles = rotation_matrix_to_euler_zyx(delta)
+        if angles is None:
+            return None
+
+        updated = {}
+        for axis, angle in angles.items():
+            span = self.span_pos if angle >= 0 else self.span_neg
+            key = axis
+            span[key] = max(span.get(key, self.min_span), abs(angle))
+            denom = span[key]
+            denom = max(denom, self.min_span)
+            normalized = float(np.clip(angle / denom, -1.0, 1.0))
+            smoothed = smooth_scalar(self.values.get(axis), normalized)
+            self.values[axis] = smoothed
+            updated[axis] = smoothed
+
+        return updated if updated else None
+
+
 def landmark_to_np(landmark):
     return np.array([landmark.x, landmark.y, landmark.z], dtype=np.float32)
 
@@ -238,6 +402,131 @@ def draw_finger_curl_ui(image, curls):
             1,
             cv2.LINE_AA,
         )
+
+
+def draw_horizontal_bars(image, horizontal_values, is_calibrated):
+    bar_width = 220
+    bar_height = 16
+    spacing = 10
+    margin_top = 30
+    margin_right = 30
+
+    h, w, _ = image.shape
+    start_x = w - margin_right - bar_width
+
+    overlay = image.copy()
+    cv2.rectangle(
+        overlay,
+        (start_x - 20, margin_top - 20),
+        (w - margin_right + 20, margin_top + (bar_height + spacing) * len(FINGER_ORDER)),
+        (0, 0, 0),
+        -1,
+    )
+    cv2.addWeighted(overlay, 0.25, image, 0.75, 0, image)
+
+    for idx, finger in enumerate(FINGER_ORDER):
+        value = float(horizontal_values.get(finger, 0.0)) if horizontal_values else 0.0
+        top = margin_top + idx * (bar_height + spacing)
+        bottom = top + bar_height
+        left = start_x
+        right = start_x + bar_width
+        center = left + bar_width // 2
+
+        cv2.rectangle(image, (left, top), (right, bottom), (80, 80, 80), 1)
+        cv2.line(image, (center, top), (center, bottom), (120, 120, 120), 1)
+
+        half_width = bar_width // 2
+        pixels = int(value * half_width)
+        if pixels > 0:
+            cv2.rectangle(image, (center, top), (center + pixels, bottom), (0, 200, 100), -1)
+        elif pixels < 0:
+            cv2.rectangle(image, (center + pixels, top), (center, bottom), (0, 140, 255), -1)
+
+        cv2.putText(
+            image,
+            f"{finger}: {value:+.2f}",
+            (left - 115, bottom - 3),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+    prompt = "Press 'C' to calibrate" if not is_calibrated else "Horizontal slide (±1)"
+    cv2.putText(
+        image,
+        prompt,
+        (start_x - 10, margin_top - 25),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+
+
+def draw_orientation_bars(image, orientation_values, is_calibrated):
+    bar_width = 220
+    bar_height = 18
+    spacing = 12
+    margin_bottom = 30
+    margin_right = 30
+
+    h, w, _ = image.shape
+    start_x = w - margin_right - bar_width
+    base_y = h - margin_bottom - (bar_height + spacing) * len(ORIENTATION_AXES)
+
+    overlay = image.copy()
+    cv2.rectangle(
+        overlay,
+        (start_x - 20, base_y - 20),
+        (w - margin_right + 20, h - margin_bottom + 10),
+        (0, 0, 0),
+        -1,
+    )
+    cv2.addWeighted(overlay, 0.25, image, 0.75, 0, image)
+
+    half_width = bar_width // 2
+    for idx, axis in enumerate(ORIENTATION_AXES):
+        value = float(orientation_values.get(axis, 0.0)) if orientation_values else 0.0
+        top = base_y + idx * (bar_height + spacing)
+        bottom = top + bar_height
+        left = start_x
+        right = start_x + bar_width
+        center = left + half_width
+
+        cv2.rectangle(image, (left, top), (right, bottom), (80, 80, 80), 1)
+        cv2.line(image, (center, top), (center, bottom), (120, 120, 120), 1)
+
+        pixels = int(value * half_width)
+        if pixels > 0:
+            cv2.rectangle(image, (center, top), (center + pixels, bottom), (120, 220, 120), -1)
+        elif pixels < 0:
+            cv2.rectangle(image, (center + pixels, top), (center, bottom), (120, 150, 255), -1)
+
+        cv2.putText(
+            image,
+            f"{axis}: {value:+.2f}",
+            (left - 110, bottom - 3),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+    prompt = "Press 'C' to calibrate" if not is_calibrated else "Pitch/Yaw/Roll (±1)"
+    cv2.putText(
+        image,
+        prompt,
+        (start_x - 10, base_y - 25),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
 # ---------------------------------------------------------
 # MAIN : Webcam + MediaPipe Tasks HandLandmarker
 # ---------------------------------------------------------
@@ -258,6 +547,9 @@ def main():
     smoothed_normals = {}
     smoothed_axes = {}
     smoothed_curls = {}
+    horizontal_tracker = HorizontalFingerTracker()
+    orientation_tracker = WristOrientationTracker()
+    calibration_requested = False
 
     # STEP 2: OpenCV webcam loop
     cap = cv2.VideoCapture(0)
@@ -308,6 +600,7 @@ def main():
                 draw_palm_normal(annotated, hand_landmarks, smoothed_normal, label)
 
             axes = compute_hand_axes(hand_landmarks)
+            axes_for_tracker = None
             if axes:
                 prev_axes = smoothed_axes.get(label, {})
                 blended_axes = {}
@@ -322,6 +615,18 @@ def main():
 
                 if blended_axes:
                     draw_hand_axes(annotated, hand_landmarks, blended_axes)
+                    axes_for_tracker = blended_axes
+                else:
+                    axes_for_tracker = axes
+            else:
+                axes_for_tracker = None
+
+            if calibration_requested and axes_for_tracker:
+                horiz_ok = horizontal_tracker.calibrate(hand_landmarks, axes_for_tracker)
+                orient_ok = orientation_tracker.calibrate(axes_for_tracker)
+                if horiz_ok or orient_ok:
+                    print("✅ Calibration enregistrée.")
+                    calibration_requested = False
 
             curls = compute_finger_curls(hand_landmarks)
             if curls:
@@ -330,11 +635,20 @@ def main():
 
                 draw_finger_curl_ui(annotated, smoothed_curls)
 
+            horizontal_tracker.update(hand_landmarks, axes_for_tracker)
+            orientation_tracker.update(axes_for_tracker)
+
+        draw_horizontal_bars(annotated, horizontal_tracker.values, horizontal_tracker.is_calibrated)
+        draw_orientation_bars(annotated, orientation_tracker.values, orientation_tracker.is_calibrated)
+
         # STEP 5: Affichage
         cv2.imshow("Hand Orientation Detector", cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR))
 
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        key = cv2.waitKey(1) & 0xFF
+        if key == ord('q'):
             break
+        if key == ord('c'):
+            calibration_requested = True
 
     cap.release()
     cv2.destroyAllWindows()
