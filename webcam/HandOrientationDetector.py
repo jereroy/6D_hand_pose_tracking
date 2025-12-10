@@ -1,5 +1,6 @@
 import cv2
 import mediapipe as mp
+import matplotlib.pyplot as plt
 import numpy as np
 from mediapipe.framework.formats import landmark_pb2
 from mediapipe.tasks import python
@@ -167,6 +168,79 @@ def draw_hand_axes(image, hand_landmarks, axes):
         )
 
 
+class WristGizmoWindow:
+    def __init__(self):
+        self.enabled = True
+        self.fig = None
+        self.ax = None
+
+        try:
+            plt.ion()
+            self.fig = plt.figure("Wrist Gizmo")
+            self.ax = self.fig.add_subplot(111, projection="3d")
+            self._configure_axes()
+            plt.show(block=False)
+        except Exception as exc:
+            self.enabled = False
+            self.fig = None
+            self.ax = None
+            print(f"⚠️ Impossible d'ouvrir la fenêtre gizmo: {exc}")
+
+    def _configure_axes(self):
+        if self.ax is None:
+            return
+
+        limit = 1.2
+        self.ax.set_xlim(-limit, limit)
+        self.ax.set_ylim(-limit, limit)
+        self.ax.set_zlim(-limit, limit)
+        self.ax.set_box_aspect((1, 1, 1))
+        self.ax.set_xlabel("X")
+        self.ax.set_ylabel("Y")
+        self.ax.set_zlabel("Z")
+        self.ax.view_init(elev=25, azim=-45)
+        self.ax.grid(True)
+
+    def update(self, rotation_matrix, angles=None):
+        if not self.enabled or self.fig is None or self.ax is None:
+            return
+
+        if not plt.fignum_exists(self.fig.number):
+            self.enabled = False
+            return
+
+        self.ax.cla()
+        self._configure_axes()
+
+        if rotation_matrix is None:
+            rotation_matrix = np.eye(3, dtype=np.float32)
+
+        axis_vectors = [
+            ("X", "r", rotation_matrix @ np.array([1.0, 0.0, 0.0], dtype=np.float32)),
+            ("Y", "g", rotation_matrix @ np.array([0.0, 1.0, 0.0], dtype=np.float32)),
+            ("Z", "b", rotation_matrix @ np.array([0.0, 0.0, 1.0], dtype=np.float32)),
+        ]
+
+        origin = np.zeros(3, dtype=np.float32)
+        for label, color, vec in axis_vectors:
+            self.ax.plot([origin[0], vec[0]], [origin[1], vec[1]], [origin[2], vec[2]], color=color, linewidth=2)
+            self.ax.text(vec[0], vec[1], vec[2], label, color=color)
+
+        if angles:
+            display = " | ".join(
+                f"{axis}: {np.rad2deg(val):+.1f}°" for axis, val in angles.items()
+            )
+            self.ax.text2D(0.05, 0.92, display, transform=self.ax.transAxes)
+
+        self.fig.canvas.draw()
+        self.fig.canvas.flush_events()
+
+    def close(self):
+        if self.fig is not None:
+            plt.ioff()
+            plt.close(self.fig)
+
+
 class HorizontalFingerTracker:
     def __init__(self, min_span=0.02):
         self.min_span = min_span
@@ -275,6 +349,8 @@ class WristOrientationTracker:
         self.span_pos = {axis: self.min_span for axis in ORIENTATION_AXES}
         self.values = {axis: 0.0 for axis in ORIENTATION_AXES}
         self.is_calibrated = False
+        self.latest_matrix = np.eye(3, dtype=np.float32)
+        self.latest_angles = {axis: 0.0 for axis in ORIENTATION_AXES}
 
     def reset(self):
         self.baseline_matrix = None
@@ -282,6 +358,8 @@ class WristOrientationTracker:
         self.span_pos = {axis: self.min_span for axis in ORIENTATION_AXES}
         self.values = {axis: 0.0 for axis in ORIENTATION_AXES}
         self.is_calibrated = False
+        self.latest_matrix = np.eye(3, dtype=np.float32)
+        self.latest_angles = {axis: 0.0 for axis in ORIENTATION_AXES}
 
     def calibrate(self, axes):
         matrix = axes_to_matrix(axes)
@@ -293,6 +371,8 @@ class WristOrientationTracker:
         self.span_pos = {axis: self.min_span for axis in ORIENTATION_AXES}
         self.values = {axis: 0.0 for axis in ORIENTATION_AXES}
         self.is_calibrated = True
+        self.latest_matrix = np.eye(3, dtype=np.float32)
+        self.latest_angles = {axis: 0.0 for axis in ORIENTATION_AXES}
         return True
 
     def update(self, axes):
@@ -308,6 +388,9 @@ class WristOrientationTracker:
         if angles is None:
             return None
 
+        self.latest_matrix = delta
+        self.latest_angles = angles
+
         updated = {}
         for axis, angle in angles.items():
             span = self.span_pos if angle >= 0 else self.span_neg
@@ -321,6 +404,18 @@ class WristOrientationTracker:
             updated[axis] = smoothed
 
         return updated if updated else None
+
+    def get_latest_matrix(self):
+        return self.latest_matrix
+
+    def get_latest_angles(self):
+        return self.latest_angles
+
+    def get_latest_matrix(self):
+        return self.latest_matrix
+
+    def get_latest_angles(self):
+        return self.latest_angles
 
 
 def landmark_to_np(landmark):
@@ -550,6 +645,7 @@ def main():
     horizontal_tracker = HorizontalFingerTracker()
     orientation_tracker = WristOrientationTracker()
     calibration_requested = False
+    gizmo_window = WristGizmoWindow()
 
     # STEP 2: OpenCV webcam loop
     cap = cv2.VideoCapture(0)
@@ -560,98 +656,105 @@ def main():
 
     print("🎉 HandOrientationDetector démarré. Appuie sur Q pour quitter.")
 
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("❌ Frame non lue.")
-            break
-
-        # Convertir frame en mp.Image
-        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-
-        # STEP 3: Détection
-        detection_result = detector.detect(mp_image)
-
-        # STEP 4: Dessin
-        annotated = draw_landmarks_on_image(rgb_frame, detection_result)
-
-        right_index = None
-        handedness_list = detection_result.handedness or []
-        for idx, handedness in enumerate(handedness_list):
-            if handedness and handedness[0].category_name.lower() == "right":
-                right_index = idx
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("❌ Frame non lue.")
                 break
 
-        if (
-            detection_result.hand_landmarks
-            and right_index is not None
-            and right_index < len(detection_result.hand_landmarks)
-        ):
-            hand_landmarks = detection_result.hand_landmarks[right_index]
-            label = "Right"
-            if handedness_list and handedness_list[right_index]:
-                label = handedness_list[right_index][0].category_name
+            # Convertir frame en mp.Image
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
 
-            normal = compute_palm_normal(hand_landmarks)
-            if normal is not None:
-                smoothed_normal = smooth_vector(smoothed_normals.get(label), normal)
-                smoothed_normals[label] = smoothed_normal
-                draw_palm_normal(annotated, hand_landmarks, smoothed_normal, label)
+            # STEP 3: Détection
+            detection_result = detector.detect(mp_image)
 
-            axes = compute_hand_axes(hand_landmarks)
-            axes_for_tracker = None
-            if axes:
-                prev_axes = smoothed_axes.get(label, {})
-                blended_axes = {}
-                smoothed_axes[label] = {}
+            # STEP 4: Dessin
+            annotated = draw_landmarks_on_image(rgb_frame, detection_result)
 
-                for axis_name, axis_vec in axes.items():
-                    blended = smooth_vector(prev_axes.get(axis_name), axis_vec)
-                    if blended is None:
-                        continue
-                    smoothed_axes[label][axis_name] = blended
-                    blended_axes[axis_name] = blended
+            right_index = None
+            handedness_list = detection_result.handedness or []
+            for idx, handedness in enumerate(handedness_list):
+                if handedness and handedness[0].category_name.lower() == "right":
+                    right_index = idx
+                    break
 
-                if blended_axes:
-                    draw_hand_axes(annotated, hand_landmarks, blended_axes)
-                    axes_for_tracker = blended_axes
-                else:
-                    axes_for_tracker = axes
-            else:
+            if (
+                detection_result.hand_landmarks
+                and right_index is not None
+                and right_index < len(detection_result.hand_landmarks)
+            ):
+                hand_landmarks = detection_result.hand_landmarks[right_index]
+                label = "Right"
+                if handedness_list and handedness_list[right_index]:
+                    label = handedness_list[right_index][0].category_name
+
+                normal = compute_palm_normal(hand_landmarks)
+                if normal is not None:
+                    smoothed_normal = smooth_vector(smoothed_normals.get(label), normal)
+                    smoothed_normals[label] = smoothed_normal
+                    draw_palm_normal(annotated, hand_landmarks, smoothed_normal, label)
+
+                axes = compute_hand_axes(hand_landmarks)
                 axes_for_tracker = None
+                if axes:
+                    prev_axes = smoothed_axes.get(label, {})
+                    blended_axes = {}
+                    smoothed_axes[label] = {}
 
-            if calibration_requested and axes_for_tracker:
-                horiz_ok = horizontal_tracker.calibrate(hand_landmarks, axes_for_tracker)
-                orient_ok = orientation_tracker.calibrate(axes_for_tracker)
-                if horiz_ok or orient_ok:
-                    print("✅ Calibration enregistrée.")
-                    calibration_requested = False
+                    for axis_name, axis_vec in axes.items():
+                        blended = smooth_vector(prev_axes.get(axis_name), axis_vec)
+                        if blended is None:
+                            continue
+                        smoothed_axes[label][axis_name] = blended
+                        blended_axes[axis_name] = blended
 
-            curls = compute_finger_curls(hand_landmarks)
-            if curls:
-                for finger, value in curls.items():
-                    smoothed_curls[finger] = smooth_scalar(smoothed_curls.get(finger), value)
+                    if blended_axes:
+                        draw_hand_axes(annotated, hand_landmarks, blended_axes)
+                        axes_for_tracker = blended_axes
+                    else:
+                        axes_for_tracker = axes
+                else:
+                    axes_for_tracker = None
 
-                draw_finger_curl_ui(annotated, smoothed_curls)
+                if calibration_requested and axes_for_tracker:
+                    horiz_ok = horizontal_tracker.calibrate(hand_landmarks, axes_for_tracker)
+                    orient_ok = orientation_tracker.calibrate(axes_for_tracker)
+                    if horiz_ok or orient_ok:
+                        print("✅ Calibration enregistrée.")
+                        calibration_requested = False
 
-            horizontal_tracker.update(hand_landmarks, axes_for_tracker)
-            orientation_tracker.update(axes_for_tracker)
+                curls = compute_finger_curls(hand_landmarks)
+                if curls:
+                    for finger, value in curls.items():
+                        smoothed_curls[finger] = smooth_scalar(smoothed_curls.get(finger), value)
 
-        draw_horizontal_bars(annotated, horizontal_tracker.values, horizontal_tracker.is_calibrated)
-        draw_orientation_bars(annotated, orientation_tracker.values, orientation_tracker.is_calibrated)
+                    draw_finger_curl_ui(annotated, smoothed_curls)
 
-        # STEP 5: Affichage
-        cv2.imshow("Hand Orientation Detector", cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR))
+                horizontal_tracker.update(hand_landmarks, axes_for_tracker)
+                orientation_tracker.update(axes_for_tracker)
 
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
-            break
-        if key == ord('c'):
-            calibration_requested = True
+            draw_horizontal_bars(annotated, horizontal_tracker.values, horizontal_tracker.is_calibrated)
+            draw_orientation_bars(annotated, orientation_tracker.values, orientation_tracker.is_calibrated)
 
-    cap.release()
-    cv2.destroyAllWindows()
+            gizmo_window.update(
+                orientation_tracker.get_latest_matrix(),
+                orientation_tracker.get_latest_angles() if orientation_tracker.is_calibrated else None,
+            )
+
+            # STEP 5: Affichage
+            cv2.imshow("Hand Orientation Detector", cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR))
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                break
+            if key == ord('c'):
+                calibration_requested = True
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        gizmo_window.close()
 
 
 if __name__ == "__main__":
