@@ -185,6 +185,7 @@ def build_udp_payload(curls, horizontal_values, orientation_tracker):
             "pitch": None,
             "yaw": None,
             "roll": None,
+            "quaternion": None,
         },
     }
 
@@ -206,6 +207,11 @@ def build_udp_payload(curls, horizontal_values, orientation_tracker):
                 "roll": float(-angles.get("Roll", 0.0)),
             }
         )
+    
+    # Ajouter quaternion (pas de gimbal lock)
+    quat = orientation_tracker.get_latest_quaternion() if orientation_tracker else None
+    if quat:
+        payload["wrist"]["quaternion"] = quat
 
     return payload
 
@@ -395,6 +401,48 @@ def rotation_matrix_to_euler_zyx(matrix):
     }
 
 
+def rotation_matrix_to_quaternion(matrix):
+    """Convert 3x3 rotation matrix to quaternion (x, y, z, w) for Unity."""
+    if matrix is None:
+        return None
+    
+    # Shepperd's method - numerically stable
+    trace = matrix[0, 0] + matrix[1, 1] + matrix[2, 2]
+    
+    if trace > 0:
+        s = 0.5 / np.sqrt(trace + 1.0)
+        w = 0.25 / s
+        x = (matrix[2, 1] - matrix[1, 2]) * s
+        y = (matrix[0, 2] - matrix[2, 0]) * s
+        z = (matrix[1, 0] - matrix[0, 1]) * s
+    elif matrix[0, 0] > matrix[1, 1] and matrix[0, 0] > matrix[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + matrix[0, 0] - matrix[1, 1] - matrix[2, 2])
+        w = (matrix[2, 1] - matrix[1, 2]) / s
+        x = 0.25 * s
+        y = (matrix[0, 1] + matrix[1, 0]) / s
+        z = (matrix[0, 2] + matrix[2, 0]) / s
+    elif matrix[1, 1] > matrix[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + matrix[1, 1] - matrix[0, 0] - matrix[2, 2])
+        w = (matrix[0, 2] - matrix[2, 0]) / s
+        x = (matrix[0, 1] + matrix[1, 0]) / s
+        y = 0.25 * s
+        z = (matrix[1, 2] + matrix[2, 1]) / s
+    else:
+        s = 2.0 * np.sqrt(1.0 + matrix[2, 2] - matrix[0, 0] - matrix[1, 1])
+        w = (matrix[1, 0] - matrix[0, 1]) / s
+        x = (matrix[0, 2] + matrix[2, 0]) / s
+        y = (matrix[1, 2] + matrix[2, 1]) / s
+        z = 0.25 * s
+    
+    # Normaliser
+    norm = np.sqrt(x*x + y*y + z*z + w*w)
+    if norm > 0:
+        x, y, z, w = x/norm, y/norm, z/norm, w/norm
+    
+    # Conversion vers système Unity (main gauche): inverser x et z
+    return {"x": float(-x), "y": float(y), "z": float(-z), "w": float(w)}
+
+
 class WristOrientationTracker:
     def __init__(self, min_span_deg=15.0):
         self.min_span = np.deg2rad(min_span_deg)
@@ -465,11 +513,8 @@ class WristOrientationTracker:
     def get_latest_angles(self):
         return self.latest_angles
 
-    def get_latest_matrix(self):
-        return self.latest_matrix
-
-    def get_latest_angles(self):
-        return self.latest_angles
+    def get_latest_quaternion(self):
+        return rotation_matrix_to_quaternion(self.latest_matrix)
 
 
 def landmark_to_np(landmark):
