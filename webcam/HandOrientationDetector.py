@@ -1,7 +1,10 @@
+import argparse
 import cv2
+import json
 import mediapipe as mp
 import matplotlib.pyplot as plt
 import numpy as np
+import socket
 from mediapipe.framework.formats import landmark_pb2
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
@@ -22,6 +25,11 @@ FINGER_TIP_INDEX = {
 # ---------------------------------------------------------
 # UTIL : Dessiner les landmarks (version simplifiée)
 # ---------------------------------------------------------
+UDP_IP = "127.0.0.1"
+UDP_PORT = 5005
+udp_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+
 def draw_landmarks_on_image(rgb_image, detection_result):
     annotated_image = rgb_image.copy()
     mp_drawing = mp.solutions.drawing_utils
@@ -166,6 +174,52 @@ def draw_hand_axes(image, hand_landmarks, axes):
             1,
             cv2.LINE_AA,
         )
+
+
+def build_udp_payload(curls, horizontal_values, orientation_tracker):
+    payload = {
+        "handedness": "Right",
+        "fingers": {},
+        "wrist": {
+            "calibrated": orientation_tracker.is_calibrated,
+            "pitch": None,
+            "yaw": None,
+            "roll": None,
+        },
+    }
+
+    curls = curls or {}
+    horizontal_values = horizontal_values or {}
+
+    for finger in FINGER_ORDER:
+        payload["fingers"][finger] = {
+            "curl": float(np.clip(curls.get(finger, 0.0), 0.0, 1.0)) if finger in curls else None,
+            "horizontal": float(horizontal_values.get(finger, 0.0)) if finger in horizontal_values else None,
+        }
+
+    angles = orientation_tracker.get_latest_angles() if orientation_tracker else None
+    if angles:
+        payload["wrist"].update(
+            {
+                "pitch": float(angles.get("Pitch", 0.0)),
+                "yaw": float(angles.get("Yaw", 0.0)),
+                "roll": float(-angles.get("Roll", 0.0)),
+            }
+        )
+
+    return payload
+
+
+def send_udp_metrics(curls, horizontal_values, orientation_tracker):
+    if udp_socket is None:
+        return
+
+    payload = build_udp_payload(curls, horizontal_values, orientation_tracker)
+    try:
+        message = json.dumps(payload).encode("utf-8")
+        udp_socket.sendto(message, (UDP_IP, UDP_PORT))
+    except OSError as exc:
+        print(f"⚠️ Erreur d'envoi UDP: {exc}")
 
 
 class WristGizmoWindow:
@@ -625,7 +679,7 @@ def draw_orientation_bars(image, orientation_values, is_calibrated):
 # ---------------------------------------------------------
 # MAIN : Webcam + MediaPipe Tasks HandLandmarker
 # ---------------------------------------------------------
-def main():
+def main(show_3d_view=False):
     # STEP 1: Create HandLandmarker
     base_options = python.BaseOptions(model_asset_path="hand_landmarker.task")
 
@@ -645,7 +699,7 @@ def main():
     horizontal_tracker = HorizontalFingerTracker()
     orientation_tracker = WristOrientationTracker()
     calibration_requested = False
-    gizmo_window = WristGizmoWindow()
+    gizmo_window = WristGizmoWindow() if show_3d_view else None
 
     # STEP 2: OpenCV webcam loop
     cap = cv2.VideoCapture(0)
@@ -724,6 +778,9 @@ def main():
                     if horiz_ok or orient_ok:
                         print("✅ Calibration enregistrée.")
                         calibration_requested = False
+                        if gizmo_window is not None:
+                            gizmo_window.close()
+                            gizmo_window = None
 
                 curls = compute_finger_curls(hand_landmarks)
                 if curls:
@@ -735,13 +792,16 @@ def main():
                 horizontal_tracker.update(hand_landmarks, axes_for_tracker)
                 orientation_tracker.update(axes_for_tracker)
 
+                send_udp_metrics(smoothed_curls, horizontal_tracker.values, orientation_tracker)
+
             draw_horizontal_bars(annotated, horizontal_tracker.values, horizontal_tracker.is_calibrated)
             draw_orientation_bars(annotated, orientation_tracker.values, orientation_tracker.is_calibrated)
 
-            gizmo_window.update(
-                orientation_tracker.get_latest_matrix(),
-                orientation_tracker.get_latest_angles() if orientation_tracker.is_calibrated else None,
-            )
+            if gizmo_window is not None:
+                gizmo_window.update(
+                    orientation_tracker.get_latest_matrix(),
+                    orientation_tracker.get_latest_angles() if orientation_tracker.is_calibrated else None,
+                )
 
             # STEP 5: Affichage
             cv2.imshow("Hand Orientation Detector", cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR))
@@ -754,8 +814,17 @@ def main():
     finally:
         cap.release()
         cv2.destroyAllWindows()
-        gizmo_window.close()
+        if gizmo_window is not None:
+            gizmo_window.close()
+        udp_socket.close()
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="Hand Orientation Detector")
+    parser.add_argument(
+        "--show-3d-view",
+        action="store_true",
+        help="Affiche la fenêtre de visu 3D (désactivée après la calibration)",
+    )
+    args = parser.parse_args()
+    main(show_3d_view=args.show_3d_view)
