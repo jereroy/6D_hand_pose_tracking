@@ -725,18 +725,34 @@ def draw_orientation_bars(image, orientation_values, is_calibrated):
 # MAIN : Webcam + MediaPipe Tasks HandLandmarker
 # ---------------------------------------------------------
 def main(show_3d_view=False):
-    # STEP 1: Create HandLandmarker
-    base_options = python.BaseOptions(model_asset_path="hand_landmarker.task")
-
-    options = vision.HandLandmarkerOptions(
-        base_options=base_options,
-        num_hands=2,
-        min_hand_detection_confidence=0.3,
-        min_hand_presence_confidence=0.3,
-        min_tracking_confidence=0.3
-    )
-
-    detector = vision.HandLandmarker.create_from_options(options)
+    import time
+    
+    # STEP 1: Create HandLandmarker with GPU acceleration
+    try:
+        base_options = python.BaseOptions(
+            model_asset_path="hand_landmarker.task",
+            delegate=python.BaseOptions.Delegate.GPU
+        )
+        options = vision.HandLandmarkerOptions(
+            base_options=base_options,
+            num_hands=1,
+            min_hand_detection_confidence=0.3,
+            min_hand_presence_confidence=0.3,
+            min_tracking_confidence=0.3
+        )
+        detector = vision.HandLandmarker.create_from_options(options)
+        print("✅ MediaPipe GPU delegate activé")
+    except Exception as e:
+        print(f"⚠️ GPU non disponible, fallback CPU: {e}")
+        base_options = python.BaseOptions(model_asset_path="hand_landmarker.task")
+        options = vision.HandLandmarkerOptions(
+            base_options=base_options,
+            num_hands=1,
+            min_hand_detection_confidence=0.3,
+            min_hand_presence_confidence=0.3,
+            min_tracking_confidence=0.3
+        )
+        detector = vision.HandLandmarker.create_from_options(options)
 
     smoothed_normals = {}
     smoothed_axes = {}
@@ -746,8 +762,19 @@ def main(show_3d_view=False):
     calibration_requested = False
     gizmo_window = WristGizmoWindow() if show_3d_view else None
 
-    # STEP 2: OpenCV webcam loop
-    cap = cv2.VideoCapture(0)
+    # FPS tracking
+    stats_timer = time.perf_counter()
+    loop_counter = 0
+    udp_counter = 0
+    loop_fps = 0.0
+    udp_fps = 0.0
+
+    # STEP 2: OpenCV webcam loop (optimisé)
+    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)  # DirectShow pour Windows = plus rapide
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    cap.set(cv2.CAP_PROP_FPS, 60)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Réduire buffer = moins de latence
 
     if not cap.isOpened():
         print("❌ Impossible d’ouvrir la webcam.")
@@ -761,6 +788,9 @@ def main(show_3d_view=False):
             if not ret:
                 print("❌ Frame non lue.")
                 break
+
+            loop_counter += 1
+            sent_udp = False
 
             # Convertir frame en mp.Image
             rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -838,6 +868,21 @@ def main(show_3d_view=False):
                 orientation_tracker.update(axes_for_tracker)
 
                 send_udp_metrics(smoothed_curls, horizontal_tracker.values, orientation_tracker)
+                sent_udp = True
+
+            if sent_udp:
+                udp_counter += 1
+
+            # FPS stats toutes les secondes
+            now = time.perf_counter()
+            if now - stats_timer >= 1.0:
+                elapsed = now - stats_timer
+                loop_fps = loop_counter / elapsed
+                udp_fps = udp_counter / elapsed
+                print(f"[Webcam] Loop FPS: {loop_fps:4.1f} | UDP: {udp_fps:4.1f} pkt/s")
+                loop_counter = 0
+                udp_counter = 0
+                stats_timer = now
 
             draw_horizontal_bars(annotated, horizontal_tracker.values, horizontal_tracker.is_calibrated)
             draw_orientation_bars(annotated, orientation_tracker.values, orientation_tracker.is_calibrated)
