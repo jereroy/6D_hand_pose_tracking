@@ -722,12 +722,23 @@ def draw_orientation_bars(image, orientation_values, is_calibrated):
         cv2.LINE_AA,
     )
 # ---------------------------------------------------------
-# MAIN : Webcam + MediaPipe Tasks HandLandmarker
+# MAIN : Webcam + MediaPipe Tasks HandLandmarker (THREADED)
 # ---------------------------------------------------------
-def main(show_3d_view=False):
+def main(show_3d_view=False, use_zed=False, headless=False, benchmark=False):
     import time
+    import pyzed.sl as sl
+    from threading import Thread, Lock
+    from queue import Queue
     
-    # STEP 1: Create HandLandmarker with GPU acceleration
+    # Benchmark timers
+    bench_capture = 0.0
+    bench_detect = 0.0
+    bench_process = 0.0
+    bench_draw = 0.0
+    bench_display = 0.0
+    bench_count = 0
+    
+    # STEP 1: Create HandLandmarker
     try:
         base_options = python.BaseOptions(
             model_asset_path="hand_landmarker.task",
@@ -769,35 +780,115 @@ def main(show_3d_view=False):
     loop_fps = 0.0
     udp_fps = 0.0
 
-    # STEP 2: OpenCV webcam loop (optimisé)
-    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)  # DirectShow pour Windows = plus rapide
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-    cap.set(cv2.CAP_PROP_FPS, 60)
-    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Réduire buffer = moins de latence
+    # STEP 2: Camera setup
+    cap = None
+    zed = None
+    zed_image = None
+    zed_runtime = None
+    
+    if use_zed:
+        # ZED Camera
+        zed = sl.Camera()
+        init_params = sl.InitParameters()
+        init_params.camera_resolution = sl.RESOLUTION.HD720
+        init_params.camera_fps = 60
+        init_params.depth_mode = sl.DEPTH_MODE.NONE
+        
+        err = zed.open(init_params)
+        if err != sl.ERROR_CODE.SUCCESS:
+            print(f"❌ Impossible d'ouvrir la ZED: {err}")
+            return
+        
+        actual_fps = zed.get_camera_information().camera_configuration.fps
+        print(f"✅ ZED Camera ouverte - FPS réel: {actual_fps}")
+        
+        zed_image = sl.Mat()
+        zed_runtime = sl.RuntimeParameters()
+    else:
+        # Webcam classique
+        cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+        cap.set(cv2.CAP_PROP_FPS, 60)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        
+        if not cap.isOpened():
+            print("❌ Impossible d'ouvrir la webcam.")
+            return
 
-    if not cap.isOpened():
-        print("❌ Impossible d’ouvrir la webcam.")
-        return
-
-    print("🎉 HandOrientationDetector démarré. Appuie sur Q pour quitter.")
+    # Threading: Queue pour les frames et résultats
+    frame_queue = Queue(maxsize=2)
+    result_queue = Queue(maxsize=2)
+    stop_flag = [False]
+    
+    def capture_thread():
+        """Thread dédié à la capture caméra."""
+        nonlocal zed_image
+        while not stop_flag[0]:
+            if use_zed:
+                err = zed.grab(zed_runtime)
+                if err != sl.ERROR_CODE.SUCCESS:
+                    continue
+                zed.retrieve_image(zed_image, sl.VIEW.LEFT)
+                frame = zed_image.get_data().copy()
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+            else:
+                ret, frame = cap.read()
+                if not ret:
+                    continue
+            
+            # Drop old frame if queue full
+            if frame_queue.full():
+                try:
+                    frame_queue.get_nowait()
+                except:
+                    pass
+            frame_queue.put((frame, time.perf_counter()))
+    
+    def detect_thread():
+        """Thread dédié à la détection MediaPipe."""
+        while not stop_flag[0]:
+            try:
+                frame, t_capture = frame_queue.get(timeout=0.1)
+            except:
+                continue
+            
+            t0 = time.perf_counter()
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
+            detection_result = detector.detect(mp_image)
+            t1 = time.perf_counter()
+            
+            # Drop old result if queue full
+            if result_queue.full():
+                try:
+                    result_queue.get_nowait()
+                except:
+                    pass
+            result_queue.put((rgb_frame, detection_result, t_capture, t1 - t0))
+    
+    # Démarrer les threads
+    cap_thread = Thread(target=capture_thread, daemon=True)
+    det_thread = Thread(target=detect_thread, daemon=True)
+    cap_thread.start()
+    det_thread.start()
+    
+    print("🎉 HandOrientationDetector démarré (THREADED). Appuie sur Q pour quitter.")
 
     try:
         while True:
-            ret, frame = cap.read()
-            if not ret:
-                print("❌ Frame non lue.")
-                break
+            t0 = time.perf_counter()
+            
+            # Récupérer le résultat de détection
+            try:
+                rgb_frame, detection_result, t_capture, detect_time = result_queue.get(timeout=0.1)
+            except:
+                continue
 
+            t1 = time.perf_counter()
+            
             loop_counter += 1
             sent_udp = False
-
-            # Convertir frame en mp.Image
-            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_frame)
-
-            # STEP 3: Détection
-            detection_result = detector.detect(mp_image)
 
             # STEP 4: Dessin
             annotated = draw_landmarks_on_image(rgb_frame, detection_result)
@@ -870,19 +961,10 @@ def main(show_3d_view=False):
                 send_udp_metrics(smoothed_curls, horizontal_tracker.values, orientation_tracker)
                 sent_udp = True
 
+            t2 = time.perf_counter()
+
             if sent_udp:
                 udp_counter += 1
-
-            # FPS stats toutes les secondes
-            now = time.perf_counter()
-            if now - stats_timer >= 1.0:
-                elapsed = now - stats_timer
-                loop_fps = loop_counter / elapsed
-                udp_fps = udp_counter / elapsed
-                print(f"[Webcam] Loop FPS: {loop_fps:4.1f} | UDP: {udp_fps:4.1f} pkt/s")
-                loop_counter = 0
-                udp_counter = 0
-                stats_timer = now
 
             draw_horizontal_bars(annotated, horizontal_tracker.values, horizontal_tracker.is_calibrated)
             draw_orientation_bars(annotated, orientation_tracker.values, orientation_tracker.is_calibrated)
@@ -893,16 +975,66 @@ def main(show_3d_view=False):
                     orientation_tracker.get_latest_angles() if orientation_tracker.is_calibrated else None,
                 )
 
-            # STEP 5: Affichage
-            cv2.imshow("Hand Orientation Detector", cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR))
+            t3 = time.perf_counter()
 
-            key = cv2.waitKey(1) & 0xFF
+            # STEP 5: Affichage (skip si headless)
+            if not headless:
+                cv2.imshow("Hand Orientation Detector", cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR))
+                key = cv2.waitKey(1) & 0xFF
+            else:
+                key = cv2.pollKey() & 0xFF
+            
+            t4 = time.perf_counter()
+            
+            # Accumuler les temps pour benchmark
+            if benchmark:
+                bench_capture += (t1 - t0)  # Temps d'attente résultat
+                bench_detect += detect_time  # Temps MediaPipe (du thread)
+                bench_process += (t2 - t1)
+                bench_draw += (t3 - t2)
+                bench_display += (t4 - t3)
+                bench_count += 1
+
+            # FPS stats toutes les secondes
+            now = time.perf_counter()
+            if now - stats_timer >= 1.0:
+                elapsed = now - stats_timer
+                loop_fps = loop_counter / elapsed
+                udp_fps = udp_counter / elapsed
+                
+                if benchmark and bench_count > 0:
+                    total = bench_capture + bench_process + bench_draw + bench_display
+                    print(f"\n{'='*60}")
+                    print(f"BENCHMARK THREADED ({bench_count} frames)")
+                    print(f"  Wait result: {1000*bench_capture/bench_count:6.2f} ms  ({100*bench_capture/total:5.1f}%)")
+                    print(f"  MediaPipe:   {1000*bench_detect/bench_count:6.2f} ms  (in parallel thread)")
+                    print(f"  Process:     {1000*bench_process/bench_count:6.2f} ms  ({100*bench_process/total:5.1f}%)")
+                    print(f"  Draw:        {1000*bench_draw/bench_count:6.2f} ms  ({100*bench_draw/total:5.1f}%)")
+                    print(f"  Display:     {1000*bench_display/bench_count:6.2f} ms  ({100*bench_display/total:5.1f}%)")
+                    print(f"  Loop time:   {1000*total/bench_count:6.2f} ms/frame")
+                    print(f"  Loop FPS:    {loop_fps:4.1f} | UDP: {udp_fps:4.1f} pkt/s")
+                    print(f"{'='*60}")
+                    bench_capture = bench_detect = bench_process = bench_draw = bench_display = 0.0
+                    bench_count = 0
+                else:
+                    print(f"[Threaded] Loop FPS: {loop_fps:4.1f} | UDP: {udp_fps:4.1f} pkt/s")
+                
+                loop_counter = 0
+                udp_counter = 0
+                stats_timer = now
+                
             if key == ord('q'):
                 break
             if key == ord('c'):
                 calibration_requested = True
     finally:
-        cap.release()
+        stop_flag[0] = True
+        cap_thread.join(timeout=1.0)
+        det_thread.join(timeout=1.0)
+        if cap is not None:
+            cap.release()
+        if zed is not None:
+            zed.close()
         cv2.destroyAllWindows()
         if gizmo_window is not None:
             gizmo_window.close()
@@ -916,5 +1048,20 @@ if __name__ == "__main__":
         action="store_true",
         help="Affiche la fenêtre de visu 3D (désactivée après la calibration)",
     )
+    parser.add_argument(
+        "--use-zed",
+        action="store_true",
+        help="Utilise la caméra ZED au lieu de la webcam",
+    )
+    parser.add_argument(
+        "--no-display",
+        action="store_true",
+        help="Désactive l'affichage pour optimiser les performances",
+    )
+    parser.add_argument(
+        "--benchmark",
+        action="store_true",
+        help="Affiche les temps détaillés de chaque étape du pipeline",
+    )
     args = parser.parse_args()
-    main(show_3d_view=args.show_3d_view)
+    main(show_3d_view=args.show_3d_view, use_zed=args.use_zed, headless=args.no_display, benchmark=args.benchmark)
