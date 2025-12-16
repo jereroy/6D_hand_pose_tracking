@@ -176,7 +176,7 @@ def draw_hand_axes(image, hand_landmarks, axes):
         )
 
 
-def build_udp_payload(curls, horizontal_values, orientation_tracker):
+def build_udp_payload(curls, horizontal_values, splay_values, orientation_tracker):
     payload = {
         "handedness": "Right",
         "fingers": {},
@@ -191,11 +191,13 @@ def build_udp_payload(curls, horizontal_values, orientation_tracker):
 
     curls = curls or {}
     horizontal_values = horizontal_values or {}
+    splay_values = splay_values or {}
 
     for finger in FINGER_ORDER:
         payload["fingers"][finger] = {
             "curl": float(np.clip(curls.get(finger, 0.0), 0.0, 1.0)) if finger in curls else None,
             "horizontal": float(horizontal_values.get(finger, 0.0)) if finger in horizontal_values else None,
+            "splay": float(np.clip(splay_values.get(finger, 0.0), 0.0, 1.0)) if finger in splay_values else None,
         }
 
     angles = orientation_tracker.get_latest_angles() if orientation_tracker else None
@@ -216,11 +218,11 @@ def build_udp_payload(curls, horizontal_values, orientation_tracker):
     return payload
 
 
-def send_udp_metrics(curls, horizontal_values, orientation_tracker):
+def send_udp_metrics(curls, horizontal_values, splay_values, orientation_tracker):
     if udp_socket is None:
         return
 
-    payload = build_udp_payload(curls, horizontal_values, orientation_tracker)
+    payload = build_udp_payload(curls, horizontal_values, splay_values, orientation_tracker)
     try:
         message = json.dumps(payload).encode("utf-8")
         udp_socket.sendto(message, (UDP_IP, UDP_PORT))
@@ -318,15 +320,18 @@ class HorizontalFingerTracker:
         self.is_calibrated = False
 
     def calibrate(self, hand_landmarks, axes):
-        if axes is None or "right" not in axes:
+        if axes is None or "right" not in axes or "forward" not in axes:
             return False
 
         wrist = landmark_to_np(hand_landmarks[0])
         right_axis = axes["right"]
+        forward_axis = axes["forward"]  # Pour le pouce
 
         for finger, tip_idx in FINGER_TIP_INDEX.items():
             tip = landmark_to_np(hand_landmarks[tip_idx])
-            projection = float(np.dot(tip - wrist, right_axis))
+            # Le pouce utilise l'axe forward (normal à la paume) au lieu de right
+            axis = forward_axis if finger == "Thumb" else right_axis
+            projection = float(np.dot(tip - wrist, axis))
             self.baseline[finger] = projection
             self.span_left[finger] = self.min_span
             self.span_right[finger] = self.min_span
@@ -336,11 +341,12 @@ class HorizontalFingerTracker:
         return True
 
     def update(self, hand_landmarks, axes):
-        if not self.is_calibrated or axes is None or "right" not in axes:
+        if not self.is_calibrated or axes is None or "right" not in axes or "forward" not in axes:
             return None
 
         wrist = landmark_to_np(hand_landmarks[0])
         right_axis = axes["right"]
+        forward_axis = axes["forward"]  # Pour le pouce
         updated = {}
 
         for finger, tip_idx in FINGER_TIP_INDEX.items():
@@ -349,7 +355,9 @@ class HorizontalFingerTracker:
                 continue
 
             tip = landmark_to_np(hand_landmarks[tip_idx])
-            projection = float(np.dot(tip - wrist, right_axis))
+            # Le pouce utilise l'axe forward (normal à la paume) au lieu de right
+            axis = forward_axis if finger == "Thumb" else right_axis
+            projection = float(np.dot(tip - wrist, axis))
             delta = projection - baseline
 
             if delta < 0:
@@ -559,6 +567,89 @@ def compute_finger_curls(hand_landmarks):
     return curls
 
 
+def compute_finger_splay(hand_landmarks, axes=None):
+    """
+    Calcule l'écartement (splay) entre doigts adjacents (sans le pouce).
+    Retourne des valeurs de 0 (doigts collés) à 1 (doigts très écartés).
+    Pas besoin de calibration - valeurs absolues basées sur les angles.
+    
+    Si axes est fourni, projette dans le repère local de la main pour
+    éviter que l'orientation de la main n'affecte le résultat.
+    """
+    # MCP indices pour chaque doigt
+    mcp_indices = {
+        "Index": 5,
+        "Middle": 9,
+        "Ring": 13,
+        "Pinky": 17,
+    }
+    tip_indices = {
+        "Index": 8,
+        "Middle": 12,
+        "Ring": 16,
+        "Pinky": 20,
+    }
+    
+    # Paires de doigts adjacents pour mesurer l'écartement (sans Thumb)
+    pairs = [
+        ("Index", "Middle"),
+        ("Middle", "Ring"),
+        ("Ring", "Pinky"),
+    ]
+    
+    splay = {}
+    
+    for finger1, finger2 in pairs:
+        # Vecteur du MCP vers le TIP pour chaque doigt
+        mcp1 = landmark_to_np(hand_landmarks[mcp_indices[finger1]])
+        tip1 = landmark_to_np(hand_landmarks[tip_indices[finger1]])
+        mcp2 = landmark_to_np(hand_landmarks[mcp_indices[finger2]])
+        tip2 = landmark_to_np(hand_landmarks[tip_indices[finger2]])
+        
+        # Direction de chaque doigt
+        dir1 = tip1 - mcp1
+        dir2 = tip2 - mcp2
+        
+        # Si on a les axes de la main, projeter dans le plan de la paume
+        # pour que l'orientation de la main n'affecte pas le résultat
+        if axes is not None and "right" in axes and "up" in axes:
+            right = axes["right"]
+            up = axes["up"]
+            
+            # Projeter sur le plan (right, up) - c'est le plan perpendiculaire à forward
+            dir1_local = np.array([np.dot(dir1, right), np.dot(dir1, up)])
+            dir2_local = np.array([np.dot(dir2, right), np.dot(dir2, up)])
+            
+            # Normaliser
+            norm1 = np.linalg.norm(dir1_local)
+            norm2 = np.linalg.norm(dir2_local)
+            if norm1 == 0 or norm2 == 0:
+                continue
+            dir1_local = dir1_local / norm1
+            dir2_local = dir2_local / norm2
+            
+            # Angle 2D dans le plan de la paume
+            dot = np.clip(np.dot(dir1_local, dir2_local), -1.0, 1.0)
+            angle = np.arccos(dot)
+        else:
+            # Fallback: angle 3D classique
+            angle = angle_between(dir1, dir2)
+            if angle is None:
+                continue
+        
+        # Normaliser: 0° = 0, ~25° = 1 (écartement max typique dans le plan)
+        max_angle = np.deg2rad(25.0)
+        normalized = float(np.clip(angle / max_angle, 0.0, 1.0))
+        
+        # Le nom de la métrique est le premier doigt de la paire
+        splay[finger1] = normalized
+    
+    # Pour Pinky, on peut utiliser la même valeur que Ring-Pinky ou 0
+    splay["Pinky"] = splay.get("Ring", 0.0)
+    
+    return splay
+
+
 def draw_finger_curl_ui(image, curls):
     bar_width = 200
     bar_height = 18
@@ -592,6 +683,67 @@ def draw_finger_curl_ui(image, curls):
             (end[0] + 15, end[1] - 3),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.5,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+
+def draw_splay_bars(image, splay_values):
+    """Affiche les barres de splay (écartement entre doigts) en bas à gauche."""
+    bar_width = 200
+    bar_height = 16
+    spacing = 10
+    margin_left = 30
+    margin_bottom = 30
+
+    h, w, _ = image.shape
+    # 3 paires de doigts: Index-Middle, Middle-Ring, Ring-Pinky
+    splay_pairs = ["Index", "Middle", "Ring"]
+    pair_labels = ["I-M", "M-R", "R-P"]
+    
+    base_y = h - margin_bottom - (bar_height + spacing) * len(splay_pairs)
+
+    overlay = image.copy()
+    cv2.rectangle(
+        overlay,
+        (margin_left - 20, base_y - 25),
+        (margin_left + bar_width + 60, h - margin_bottom + 10),
+        (0, 0, 0),
+        -1,
+    )
+    cv2.addWeighted(overlay, 0.25, image, 0.75, 0, image)
+
+    # Titre
+    cv2.putText(
+        image,
+        "Splay (0-1)",
+        (margin_left, base_y - 8),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.45,
+        (255, 255, 255),
+        1,
+        cv2.LINE_AA,
+    )
+
+    for idx, (finger, label) in enumerate(zip(splay_pairs, pair_labels)):
+        value = float(np.clip(splay_values.get(finger, 0.0), 0.0, 1.0)) if splay_values else 0.0
+        top = base_y + idx * (bar_height + spacing)
+        bottom = top + bar_height
+        left = margin_left
+        right = margin_left + bar_width
+
+        cv2.rectangle(image, (left, top), (right, bottom), (80, 80, 80), 1)
+        fill_width = int(bar_width * value)
+        if fill_width > 0:
+            cv2.rectangle(image, (left, top), (left + fill_width, bottom), (255, 180, 0), -1)
+
+        cv2.putText(
+            image,
+            f"{label}: {value:.2f}",
+            (right + 10, bottom - 3),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.45,
             (255, 255, 255),
             1,
             cv2.LINE_AA,
@@ -768,6 +920,7 @@ def main(show_3d_view=False, use_zed=False, headless=False, benchmark=False):
     smoothed_normals = {}
     smoothed_axes = {}
     smoothed_curls = {}
+    smoothed_splay = {}
     horizontal_tracker = HorizontalFingerTracker()
     orientation_tracker = WristOrientationTracker()
     calibration_requested = False
@@ -955,10 +1108,17 @@ def main(show_3d_view=False, use_zed=False, headless=False, benchmark=False):
 
                     draw_finger_curl_ui(annotated, smoothed_curls)
 
+                # Calcul du splay (écartement entre doigts) - pas besoin de calibration
+                # On passe les axes pour projeter dans le plan de la paume
+                splay = compute_finger_splay(hand_landmarks, axes_for_tracker)
+                if splay:
+                    for finger, value in splay.items():
+                        smoothed_splay[finger] = smooth_scalar(smoothed_splay.get(finger), value)
+
                 horizontal_tracker.update(hand_landmarks, axes_for_tracker)
                 orientation_tracker.update(axes_for_tracker)
 
-                send_udp_metrics(smoothed_curls, horizontal_tracker.values, orientation_tracker)
+                send_udp_metrics(smoothed_curls, horizontal_tracker.values, smoothed_splay, orientation_tracker)
                 sent_udp = True
 
             t2 = time.perf_counter()
@@ -968,6 +1128,7 @@ def main(show_3d_view=False, use_zed=False, headless=False, benchmark=False):
 
             draw_horizontal_bars(annotated, horizontal_tracker.values, horizontal_tracker.is_calibrated)
             draw_orientation_bars(annotated, orientation_tracker.values, orientation_tracker.is_calibrated)
+            draw_splay_bars(annotated, smoothed_splay)
 
             if gizmo_window is not None:
                 gizmo_window.update(
