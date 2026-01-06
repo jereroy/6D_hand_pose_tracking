@@ -176,7 +176,7 @@ def draw_hand_axes(image, hand_landmarks, axes):
         )
 
 
-def build_udp_payload(curls, horizontal_values, splay_values, orientation_tracker):
+def build_udp_payload(curls, splay_values, orientation_tracker):
     payload = {
         "handedness": "Right",
         "fingers": {},
@@ -190,13 +190,11 @@ def build_udp_payload(curls, horizontal_values, splay_values, orientation_tracke
     }
 
     curls = curls or {}
-    horizontal_values = horizontal_values or {}
     splay_values = splay_values or {}
 
     for finger in FINGER_ORDER:
         payload["fingers"][finger] = {
             "curl": float(np.clip(curls.get(finger, 0.0), 0.0, 1.0)) if finger in curls else None,
-            "horizontal": float(horizontal_values.get(finger, 0.0)) if finger in horizontal_values else None,
             "splay": float(np.clip(splay_values.get(finger, 0.0), 0.0, 1.0)) if finger in splay_values else None,
         }
 
@@ -218,11 +216,11 @@ def build_udp_payload(curls, horizontal_values, splay_values, orientation_tracke
     return payload
 
 
-def send_udp_metrics(curls, horizontal_values, splay_values, orientation_tracker):
+def send_udp_metrics(curls, splay_values, orientation_tracker):
     if udp_socket is None:
         return
 
-    payload = build_udp_payload(curls, horizontal_values, splay_values, orientation_tracker)
+    payload = build_udp_payload(curls, splay_values, orientation_tracker)
     try:
         message = json.dumps(payload).encode("utf-8")
         udp_socket.sendto(message, (UDP_IP, UDP_PORT))
@@ -301,79 +299,6 @@ class WristGizmoWindow:
         if self.fig is not None:
             plt.ioff()
             plt.close(self.fig)
-
-
-class HorizontalFingerTracker:
-    def __init__(self, min_span=0.02):
-        self.min_span = min_span
-        self.baseline = {}
-        self.span_left = {}
-        self.span_right = {}
-        self.values = {}
-        self.is_calibrated = False
-
-    def reset(self):
-        self.baseline.clear()
-        self.span_left.clear()
-        self.span_right.clear()
-        self.values.clear()
-        self.is_calibrated = False
-
-    def calibrate(self, hand_landmarks, axes):
-        if axes is None or "right" not in axes or "forward" not in axes:
-            return False
-
-        wrist = landmark_to_np(hand_landmarks[0])
-        right_axis = axes["right"]
-        forward_axis = axes["forward"]  # Pour le pouce
-
-        for finger, tip_idx in FINGER_TIP_INDEX.items():
-            tip = landmark_to_np(hand_landmarks[tip_idx])
-            # Le pouce utilise l'axe forward (normal à la paume) au lieu de right
-            axis = forward_axis if finger == "Thumb" else right_axis
-            projection = float(np.dot(tip - wrist, axis))
-            self.baseline[finger] = projection
-            self.span_left[finger] = self.min_span
-            self.span_right[finger] = self.min_span
-            self.values[finger] = 0.0
-
-        self.is_calibrated = True
-        return True
-
-    def update(self, hand_landmarks, axes):
-        if not self.is_calibrated or axes is None or "right" not in axes or "forward" not in axes:
-            return None
-
-        wrist = landmark_to_np(hand_landmarks[0])
-        right_axis = axes["right"]
-        forward_axis = axes["forward"]  # Pour le pouce
-        updated = {}
-
-        for finger, tip_idx in FINGER_TIP_INDEX.items():
-            baseline = self.baseline.get(finger)
-            if baseline is None:
-                continue
-
-            tip = landmark_to_np(hand_landmarks[tip_idx])
-            # Le pouce utilise l'axe forward (normal à la paume) au lieu de right
-            axis = forward_axis if finger == "Thumb" else right_axis
-            projection = float(np.dot(tip - wrist, axis))
-            delta = projection - baseline
-
-            if delta < 0:
-                self.span_left[finger] = max(self.span_left.get(finger, self.min_span), abs(delta))
-                denom = self.span_left[finger]
-            else:
-                self.span_right[finger] = max(self.span_right.get(finger, self.min_span), abs(delta))
-                denom = self.span_right[finger]
-
-            denom = max(denom, self.min_span)
-            normalized = float(np.clip(delta / denom, -1.0, 1.0))
-            smoothed = smooth_scalar(self.values.get(finger), normalized)
-            self.values[finger] = smoothed
-            updated[finger] = smoothed
-
-        return updated if updated else None
 
 
 def axes_to_matrix(axes):
@@ -768,68 +693,6 @@ def draw_splay_bars(image, splay_values):
         )
 
 
-def draw_horizontal_bars(image, horizontal_values, is_calibrated):
-    bar_width = 220
-    bar_height = 16
-    spacing = 10
-    margin_top = 30
-    margin_right = 30
-
-    h, w, _ = image.shape
-    start_x = w - margin_right - bar_width
-
-    overlay = image.copy()
-    cv2.rectangle(
-        overlay,
-        (start_x - 20, margin_top - 20),
-        (w - margin_right + 20, margin_top + (bar_height + spacing) * len(FINGER_ORDER)),
-        (0, 0, 0),
-        -1,
-    )
-    cv2.addWeighted(overlay, 0.25, image, 0.75, 0, image)
-
-    for idx, finger in enumerate(FINGER_ORDER):
-        value = float(horizontal_values.get(finger, 0.0)) if horizontal_values else 0.0
-        top = margin_top + idx * (bar_height + spacing)
-        bottom = top + bar_height
-        left = start_x
-        right = start_x + bar_width
-        center = left + bar_width // 2
-
-        cv2.rectangle(image, (left, top), (right, bottom), (80, 80, 80), 1)
-        cv2.line(image, (center, top), (center, bottom), (120, 120, 120), 1)
-
-        half_width = bar_width // 2
-        pixels = int(value * half_width)
-        if pixels > 0:
-            cv2.rectangle(image, (center, top), (center + pixels, bottom), (0, 200, 100), -1)
-        elif pixels < 0:
-            cv2.rectangle(image, (center + pixels, top), (center, bottom), (0, 140, 255), -1)
-
-        cv2.putText(
-            image,
-            f"{finger}: {value:+.2f}",
-            (left - 115, bottom - 3),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
-            (255, 255, 255),
-            1,
-            cv2.LINE_AA,
-        )
-
-    prompt = "Press 'C' to calibrate" if not is_calibrated else "Horizontal slide (±1)"
-    cv2.putText(
-        image,
-        prompt,
-        (start_x - 10, margin_top - 25),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.45,
-        (255, 255, 255),
-        1,
-        cv2.LINE_AA,
-    )
-
-
 def draw_orientation_bars(image, orientation_values, is_calibrated):
     bar_width = 220
     bar_height = 18
@@ -939,7 +802,6 @@ def main(show_3d_view=False, use_zed=False, headless=False, benchmark=False):
     smoothed_axes = {}
     smoothed_curls = {}
     smoothed_splay = {}
-    horizontal_tracker = HorizontalFingerTracker()
     orientation_tracker = WristOrientationTracker()
     calibration_requested = False
     gizmo_window = WristGizmoWindow() if show_3d_view else None
@@ -1110,9 +972,8 @@ def main(show_3d_view=False, use_zed=False, headless=False, benchmark=False):
                     axes_for_tracker = None
 
                 if calibration_requested and axes_for_tracker:
-                    horiz_ok = horizontal_tracker.calibrate(hand_landmarks, axes_for_tracker)
                     orient_ok = orientation_tracker.calibrate(axes_for_tracker)
-                    if horiz_ok or orient_ok:
+                    if orient_ok:
                         print("✅ Calibration enregistrée.")
                         calibration_requested = False
                         if gizmo_window is not None:
@@ -1133,10 +994,9 @@ def main(show_3d_view=False, use_zed=False, headless=False, benchmark=False):
                     for finger, value in splay.items():
                         smoothed_splay[finger] = smooth_scalar(smoothed_splay.get(finger), value)
 
-                horizontal_tracker.update(hand_landmarks, axes_for_tracker)
                 orientation_tracker.update(axes_for_tracker)
 
-                send_udp_metrics(smoothed_curls, horizontal_tracker.values, smoothed_splay, orientation_tracker)
+                send_udp_metrics(smoothed_curls, smoothed_splay, orientation_tracker)
                 sent_udp = True
 
             t2 = time.perf_counter()
@@ -1144,7 +1004,6 @@ def main(show_3d_view=False, use_zed=False, headless=False, benchmark=False):
             if sent_udp:
                 udp_counter += 1
 
-            draw_horizontal_bars(annotated, horizontal_tracker.values, horizontal_tracker.is_calibrated)
             draw_orientation_bars(annotated, orientation_tracker.values, orientation_tracker.is_calibrated)
             draw_splay_bars(annotated, smoothed_splay)
 
