@@ -569,82 +569,100 @@ def compute_finger_curls(hand_landmarks):
 
 def compute_finger_splay(hand_landmarks, axes=None):
     """
-    Calcule l'écartement (splay) entre doigts adjacents (sans le pouce).
+    Calcule l'écartement (splay) entre doigts adjacents en utilisant des ANGLES.
+    
+    Méthode: On mesure l'angle entre les vecteurs MCP→PIP de doigts adjacents,
+    projeté dans le plan de la paume. Les angles sont invariants à la distance caméra.
+    
     Retourne des valeurs de 0 (doigts collés) à 1 (doigts très écartés).
-    Pas besoin de calibration - valeurs absolues basées sur les angles.
-    
-    Si axes est fourni, projette dans le repère local de la main pour
-    éviter que l'orientation de la main n'affecte le résultat.
     """
-    # MCP indices pour chaque doigt
-    mcp_indices = {
-        "Index": 5,
-        "Middle": 9,
-        "Ring": 13,
-        "Pinky": 17,
-    }
-    tip_indices = {
-        "Index": 8,
-        "Middle": 12,
-        "Ring": 16,
-        "Pinky": 20,
-    }
+    # MCP et PIP indices pour les 4 doigts
+    mcp_indices = {"Index": 5, "Middle": 9, "Ring": 13, "Pinky": 17}
+    pip_indices = {"Index": 6, "Middle": 10, "Ring": 14, "Pinky": 18}
     
-    # Paires de doigts adjacents pour mesurer l'écartement (sans Thumb)
+    # Indices du pouce: CMC=1, MCP=2, IP=3, TIP=4
+    THUMB_CMC = 1
+    THUMB_MCP = 2
+    
     pairs = [
         ("Index", "Middle"),
         ("Middle", "Ring"),
         ("Ring", "Pinky"),
     ]
     
+    # Angles de référence (en radians) - déterminés empiriquement
+    # Doigts collés ~ 5-8°, doigts écartés ~ 20-35°
+    MIN_ANGLE_DEG = 5.0
+    MAX_ANGLE_DEG = 30.0
+    min_angle = np.deg2rad(MIN_ANGLE_DEG)
+    max_angle = np.deg2rad(MAX_ANGLE_DEG)
+    
+    # Pour le pouce, la plage est plus grande (il peut s'écarter beaucoup plus)
+    THUMB_MIN_ANGLE_DEG = 20.0   # Pouce collé à l'index
+    THUMB_MAX_ANGLE_DEG = 80.0   # Pouce très écarté
+    thumb_min_angle = np.deg2rad(THUMB_MIN_ANGLE_DEG)
+    thumb_max_angle = np.deg2rad(THUMB_MAX_ANGLE_DEG)
+    
     splay = {}
     
+    # --- Splay du pouce par rapport à l'index ---
+    # Vecteur du pouce: CMC → MCP (direction de la base du pouce)
+    thumb_cmc = landmark_to_np(hand_landmarks[THUMB_CMC])
+    thumb_mcp = landmark_to_np(hand_landmarks[THUMB_MCP])
+    vec_thumb = thumb_mcp - thumb_cmc
+    
+    # Vecteur de l'index: MCP → PIP
+    index_mcp = landmark_to_np(hand_landmarks[mcp_indices["Index"]])
+    index_pip = landmark_to_np(hand_landmarks[pip_indices["Index"]])
+    vec_index = index_pip - index_mcp
+    
+    # Projeter dans le plan de la paume si disponible
+    if axes is not None and "forward" in axes:
+        forward = axes["forward"]
+        vec_thumb_proj = vec_thumb - np.dot(vec_thumb, forward) * forward
+        vec_index_proj = vec_index - np.dot(vec_index, forward) * forward
+    else:
+        vec_thumb_proj = vec_thumb
+        vec_index_proj = vec_index
+    
+    thumb_angle = angle_between(vec_thumb_proj, vec_index_proj)
+    if thumb_angle is not None:
+        thumb_normalized = float(np.clip(
+            (thumb_angle - thumb_min_angle) / (thumb_max_angle - thumb_min_angle), 
+            0.0, 1.0
+        ))
+        splay["Thumb"] = thumb_normalized
+    
+    # --- Splay des autres doigts ---
     for finger1, finger2 in pairs:
-        # Vecteur du MCP vers le TIP pour chaque doigt
+        # Vecteur du doigt 1: MCP → PIP
         mcp1 = landmark_to_np(hand_landmarks[mcp_indices[finger1]])
-        tip1 = landmark_to_np(hand_landmarks[tip_indices[finger1]])
+        pip1 = landmark_to_np(hand_landmarks[pip_indices[finger1]])
+        vec1 = pip1 - mcp1
+        
+        # Vecteur du doigt 2: MCP → PIP
         mcp2 = landmark_to_np(hand_landmarks[mcp_indices[finger2]])
-        tip2 = landmark_to_np(hand_landmarks[tip_indices[finger2]])
+        pip2 = landmark_to_np(hand_landmarks[pip_indices[finger2]])
+        vec2 = pip2 - mcp2
         
-        # Direction de chaque doigt
-        dir1 = tip1 - mcp1
-        dir2 = tip2 - mcp2
+        # Si on a les axes de la paume, projeter les vecteurs dans le plan de la paume
+        # Cela rend la mesure plus stable car on ignore la composante de curl
+        if axes is not None and "forward" in axes:
+            forward = axes["forward"]  # Normale à la paume
+            # Projeter vec1 et vec2 dans le plan perpendiculaire à forward
+            vec1 = vec1 - np.dot(vec1, forward) * forward
+            vec2 = vec2 - np.dot(vec2, forward) * forward
         
-        # Si on a les axes de la main, projeter dans le plan de la paume
-        # pour que l'orientation de la main n'affecte pas le résultat
-        if axes is not None and "right" in axes and "up" in axes:
-            right = axes["right"]
-            up = axes["up"]
-            
-            # Projeter sur le plan (right, up) - c'est le plan perpendiculaire à forward
-            dir1_local = np.array([np.dot(dir1, right), np.dot(dir1, up)])
-            dir2_local = np.array([np.dot(dir2, right), np.dot(dir2, up)])
-            
-            # Normaliser
-            norm1 = np.linalg.norm(dir1_local)
-            norm2 = np.linalg.norm(dir2_local)
-            if norm1 == 0 or norm2 == 0:
-                continue
-            dir1_local = dir1_local / norm1
-            dir2_local = dir2_local / norm2
-            
-            # Angle 2D dans le plan de la paume
-            dot = np.clip(np.dot(dir1_local, dir2_local), -1.0, 1.0)
-            angle = np.arccos(dot)
-        else:
-            # Fallback: angle 3D classique
-            angle = angle_between(dir1, dir2)
-            if angle is None:
-                continue
+        # Calculer l'angle entre les deux vecteurs
+        angle = angle_between(vec1, vec2)
+        if angle is None:
+            continue
         
-        # Normaliser: 0° = 0, ~25° = 1 (écartement max typique dans le plan)
-        max_angle = np.deg2rad(25.0)
-        normalized = float(np.clip(angle / max_angle, 0.0, 1.0))
-        
-        # Le nom de la métrique est le premier doigt de la paire
+        # Normaliser l'angle entre 0 et 1
+        normalized = float(np.clip((angle - min_angle) / (max_angle - min_angle), 0.0, 1.0))
         splay[finger1] = normalized
     
-    # Pour Pinky, on peut utiliser la même valeur que Ring-Pinky ou 0
+    # Le Pinky n'a pas de voisin à droite, on copie la valeur Ring-Pinky
     splay["Pinky"] = splay.get("Ring", 0.0)
     
     return splay
@@ -698,9 +716,9 @@ def draw_splay_bars(image, splay_values):
     margin_bottom = 30
 
     h, w, _ = image.shape
-    # 3 paires de doigts: Index-Middle, Middle-Ring, Ring-Pinky
-    splay_pairs = ["Index", "Middle", "Ring"]
-    pair_labels = ["I-M", "M-R", "R-P"]
+    # 4 paires de doigts: Thumb-Index, Index-Middle, Middle-Ring, Ring-Pinky
+    splay_pairs = ["Thumb", "Index", "Middle", "Ring"]
+    pair_labels = ["T-I", "I-M", "M-R", "R-P"]
     
     base_y = h - margin_bottom - (bar_height + spacing) * len(splay_pairs)
 
